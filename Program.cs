@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Management;
 using System.Net;
+using System.Net.Http;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Security.Principal;
@@ -493,13 +494,16 @@ namespace PrinterFixTool
                 return;
             }
 
-            PrintColored($"  [*] Bắt đầu quét nhanh dải mạng {subnetPrefix}1 -> {subnetPrefix}254 qua TCP Port 9100 (RAW Print)...", ConsoleColor.Yellow);
-            PrintColored("      (Sử dụng cơ chế song song đa luồng với timeout 280ms/host, hoàn thành trong ~1-2 giây)", ConsoleColor.DarkGray);
+            PrintColored($"  [*] Bắt đầu quét dải mạng {subnetPrefix}1 -> {subnetPrefix}254 qua TCP Port 9100 (RAW Print)...", ConsoleColor.Yellow);
+            PrintColored("      (Sử dụng SemaphoreSlim(50) giới hạn 50 kết nối đồng thời, timeout 450ms/host chống nghẽn mạng)...", ConsoleColor.DarkGray);
 
             var sw = Stopwatch.StartNew();
-            var candidates = new ConcurrentBag<(string Ip, string HostName)>();
+            var candidates = new ConcurrentBag<(string Ip, string DeviceName)>();
 
-            // Quét đồng thời từ .1 đến .254
+            // Chống nghẽn mạng: Giới hạn tối đa 50 kết nối TCP đồng thời
+            using var semaphore = new SemaphoreSlim(50, 50);
+
+            // Quét từ .1 đến .254
             var scanTasks = new List<Task>();
             for (int i = 1; i <= 254; i++)
             {
@@ -513,26 +517,20 @@ namespace PrinterFixTool
 
                 scanTasks.Add(Task.Run(async () =>
                 {
-                    if (await IsPortOpenAsync(targetIp, 9100, 280))
+                    await semaphore.WaitAsync();
+                    try
                     {
-                        string hostName = "";
-                        try
+                        // Kiểm tra kết nối cổng 9100 với timeout 450ms để nhận diện máy in qua Wi-Fi/Switch phản hồi chậm
+                        if (await IsPortOpenAsync(targetIp, 9100, 450))
                         {
-                            using var dnsCts = new CancellationTokenSource(300);
-                            var dnsTask = Dns.GetHostEntryAsync(targetIp);
-                            var completed = await Task.WhenAny(dnsTask, Task.Delay(300, dnsCts.Token));
-                            if (completed == dnsTask)
-                            {
-                                var entry = await dnsTask;
-                                hostName = entry.HostName ?? "";
-                            }
+                            // Nhận diện tên máy in thực tế qua HTTP/HTTPS EWS và Reverse DNS
+                            string deviceName = await GetPrinterDeviceNameAsync(targetIp);
+                            candidates.Add((targetIp, deviceName));
                         }
-                        catch
-                        {
-                            // Bỏ qua lỗi nếu IP không phân giải được Reverse DNS
-                        }
-
-                        candidates.Add((targetIp, hostName));
+                    }
+                    finally
+                    {
+                        semaphore.Release();
                     }
                 }));
             }
@@ -563,13 +561,14 @@ namespace PrinterFixTool
             {
                 // Trường hợp 2: Tìm thấy DUY NHẤT 1 IP máy in mới
                 var singleCandidate = validCandidates[0];
-                string hostInfo = string.IsNullOrWhiteSpace(singleCandidate.HostName) ? "" : $" (Tên máy chủ: {singleCandidate.HostName})";
-                PrintColored($"  -> [TÌM THẤY DUY NHẤT 1 MÁY IN MỚI] Phát hiện IP {singleCandidate.Ip}{hostInfo} mở cổng 9100!", ConsoleColor.Green);
+                PrintColored($"  -> [TÌM THẤY DUY NHẤT 1 MÁY IN MỚI] Phát hiện IP {singleCandidate.Ip} [{singleCandidate.DeviceName}] mở cổng 9100!", ConsoleColor.Green);
                 PrintColored($"  -> Tiến hành tự động cập nhật cổng '{portName}' từ IP cũ [{oldIp}] sang IP mới [{singleCandidate.Ip}]...", ConsoleColor.Yellow);
 
                 bool success = ApplyNewPrinterIp(portName, singleCandidate.Ip);
                 if (success)
                 {
+                    // Cập nhật bộ nhớ đệm ngay lập tức để tránh các máy in tiếp theo nhận nhầm
+                    existingPrinterIps.Remove(oldIp);
                     existingPrinterIps.Add(singleCandidate.Ip);
                     tcpPortMap[portName] = singleCandidate.Ip;
                 }
@@ -581,8 +580,7 @@ namespace PrinterFixTool
                 for (int idx = 0; idx < validCandidates.Count; idx++)
                 {
                     var item = validCandidates[idx];
-                    string hostInfo = string.IsNullOrWhiteSpace(item.HostName) ? "" : $" (HostName: {item.HostName})";
-                    PrintColored($"     [{idx + 1}] IP: {item.Ip}{hostInfo}", ConsoleColor.White);
+                    PrintColored($"     [{idx + 1}] {item.Ip} [{item.DeviceName}]", ConsoleColor.White);
                 }
                 PrintColored("     [0] Bỏ qua, không thay đổi cấu hình cổng.", ConsoleColor.DarkGray);
 
@@ -597,10 +595,12 @@ namespace PrinterFixTool
                     if (int.TryParse(input, out int selectedIndex) && selectedIndex >= 1 && selectedIndex <= validCandidates.Count)
                     {
                         var chosen = validCandidates[selectedIndex - 1];
-                        PrintColored($"  -> Bạn đã chọn IP: {chosen.Ip}. Đang tiến hành cập nhật cổng '{portName}'...", ConsoleColor.Yellow);
+                        PrintColored($"  -> Bạn đã chọn IP: {chosen.Ip} [{chosen.DeviceName}]. Đang tiến hành cập nhật cổng '{portName}'...", ConsoleColor.Yellow);
                         bool success = ApplyNewPrinterIp(portName, chosen.Ip);
                         if (success)
                         {
+                            // Cập nhật bộ nhớ đệm ngay lập tức để tránh các máy in tiếp theo nhận nhầm
+                            existingPrinterIps.Remove(oldIp);
                             existingPrinterIps.Add(chosen.Ip);
                             tcpPortMap[portName] = chosen.Ip;
                         }
@@ -633,6 +633,102 @@ namespace PrinterFixTool
             {
                 return false;
             }
+        }
+
+        /// <summary>
+        /// Nhận diện tên thực tế của máy in bằng cách truy vấn HTTP/HTTPS Embedded Web Server (EWS) và Reverse DNS
+        /// </summary>
+        private static async Task<string> GetPrinterDeviceNameAsync(string ip)
+        {
+            string dnsHost = "";
+            try
+            {
+                using var dnsCts = new CancellationTokenSource(350);
+                var dnsTask = Dns.GetHostEntryAsync(ip);
+                var completed = await Task.WhenAny(dnsTask, Task.Delay(350, dnsCts.Token));
+                if (completed == dnsTask)
+                {
+                    var entry = await dnsTask;
+                    dnsHost = entry.HostName ?? "";
+                }
+            }
+            catch
+            {
+                // Bỏ qua lỗi DNS
+            }
+
+            string webTitle = "";
+            string serverHeader = "";
+
+            try
+            {
+                using var handler = new HttpClientHandler
+                {
+                    ServerCertificateCustomValidationCallback = (sender, cert, chain, sslPolicyErrors) => true,
+                    AllowAutoRedirect = true,
+                    MaxAutomaticRedirections = 3
+                };
+
+                using var client = new HttpClient(handler)
+                {
+                    Timeout = TimeSpan.FromMilliseconds(800)
+                };
+
+                HttpResponseMessage? response = null;
+                try
+                {
+                    response = await client.GetAsync($"http://{ip}/");
+                }
+                catch
+                {
+                    try
+                    {
+                        response = await client.GetAsync($"https://{ip}/");
+                    }
+                    catch
+                    {
+                        // Bỏ qua nếu cả HTTP và HTTPS đều không phản hồi
+                    }
+                }
+
+                if (response != null)
+                {
+                    // Đọc header Server nếu có
+                    if (response.Headers.Server != null && response.Headers.Server.Any())
+                    {
+                        serverHeader = string.Join(" ", response.Headers.Server).Trim();
+                    }
+
+                    string html = await response.Content.ReadAsStringAsync();
+                    var match = Regex.Match(html, @"<title[^>]*>(.*?)</title>", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+                    if (match.Success)
+                    {
+                        string rawTitle = match.Groups[1].Value.Trim();
+                        webTitle = WebUtility.HtmlDecode(rawTitle);
+                        webTitle = Regex.Replace(webTitle, @"\s+", " ").Trim();
+                    }
+                }
+            }
+            catch
+            {
+                // Bỏ qua lỗi HTTP
+            }
+
+            var details = new List<string>();
+            if (!string.IsNullOrWhiteSpace(webTitle))
+            {
+                details.Add(webTitle);
+            }
+            if (!string.IsNullOrWhiteSpace(serverHeader) && !details.Any(d => d.Contains(serverHeader, StringComparison.OrdinalIgnoreCase)))
+            {
+                details.Add(serverHeader);
+            }
+            if (!string.IsNullOrWhiteSpace(dnsHost) && !details.Any(d => d.Contains(dnsHost, StringComparison.OrdinalIgnoreCase)))
+            {
+                details.Add(dnsHost);
+            }
+
+            return details.Count > 0 ? string.Join(" / ", details) : "Thiết bị RAW Print 9100";
         }
 
         private static bool ApplyNewPrinterIp(string portName, string newIp)
