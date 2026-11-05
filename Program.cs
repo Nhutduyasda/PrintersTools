@@ -1,14 +1,19 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Management;
+using System.Net;
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Security.Principal;
 using System.ServiceProcess;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Win32;
 
 namespace PrinterFixTool
@@ -19,11 +24,12 @@ namespace PrinterFixTool
         private static int _totalPrintersScanned = 0;
         private static int _offlineFixedCount = 0;
         private static int _networkPrintersCount = 0;
+        private static int _ipUpdatedCount = 0;
         private static int _spoolFilesRemoved = 0;
         private static bool _spoolerRestartedSuccessfully = false;
         private static bool _registryPatchedSuccessfully = false;
 
-        static void Main(string[] args)
+        static async Task Main(string[] args)
         {
             Console.OutputEncoding = Encoding.UTF8;
             Console.InputEncoding = Encoding.UTF8;
@@ -33,10 +39,10 @@ namespace PrinterFixTool
             // 0. Kiểm tra quyền Administrator
             CheckAdminPrivileges();
 
-            // Module 1: Quét WMI, kiểm tra trạng thái máy in, tự động gỡ Offline & Ping kiểm tra mạng
-            RunModule1_PrinterScanAndFix();
+            // Module 1: Quét WMI, kiểm tra trạng thái máy in, tự động gỡ Offline, Ping & Tự động quét tìm IP mới (Port 9100)
+            await RunModule1_PrinterScanAndFixAsync();
 
-            // Module 2: Làm sạch Print Spooler (xóa lệnh in kẹt .spl, .shd, .tmp)
+            // Module 2: Làm sạch Print Spooler (xóa lệnh in kẹt .spl, .shd, .tmp) & Khởi động lại Spooler để nạp IP mới
             RunModule2_CleanPrintSpooler();
 
             // Module 3: Vá lỗi Registry chia sẻ máy in mạng LAN (0x0000011b & 0x00000709)
@@ -67,7 +73,7 @@ namespace PrinterFixTool
             Console.ForegroundColor = ConsoleColor.Cyan;
             Console.WriteLine("================================================================================");
             Console.WriteLine("          CÔNG CỤ TỰ ĐỘNG CHẨN ĐOÁN & SỬA LỖI MÁY IN WINDOWS (.NET 8)          ");
-            Console.WriteLine("                      Senior Systems Engineering Tool                          ");
+            Console.WriteLine("                Tích hợp Tự Động Quét Tìm IP Máy In Mạng (Port 9100)           ");
             Console.WriteLine("================================================================================");
             Console.ResetColor();
             Console.WriteLine();
@@ -102,7 +108,7 @@ namespace PrinterFixTool
                 }
                 else
                 {
-                    PrintColored("[CẢNH BÁO] Ứng dụng KHÔNG chạy với quyền Administrator! Một số thao tác như dừng dịch vụ Spooler hoặc sửa Registry có thể bị từ chối truy cập.", ConsoleColor.Red);
+                    PrintColored("[CẢNH BÁO] Ứng dụng KHÔNG chạy với quyền Administrator! Một số thao tác như dừng dịch vụ Spooler, sửa Registry hoặc cập nhật IP cổng có thể bị từ chối truy cập.", ConsoleColor.Red);
                 }
             }
             catch (Exception ex)
@@ -113,9 +119,9 @@ namespace PrinterFixTool
 
         #endregion
 
-        #region Module 1: Quét WMI & Tự động gỡ Offline & Ping kiểm tra mạng
+        #region Module 1: Quét WMI & Tự động gỡ Offline & Ping & Quét tìm IP mới (Port 9100)
 
-        private static void RunModule1_PrinterScanAndFix()
+        private static async Task RunModule1_PrinterScanAndFixAsync()
         {
             PrintSectionHeader("MODULE 1: QUÉT WMI, TỰ ĐỘNG GỠ OFFLINE & KIỂM TRA MẠNG MÁY IN");
 
@@ -123,6 +129,11 @@ namespace PrinterFixTool
             PrintColored("[*] Đang truy vấn danh sách cổng TCP/IP từ Win32_TCPIPPrinterPort...", ConsoleColor.Yellow);
             var tcpPortMap = GetTcpIpPrinterPorts();
             PrintColored($"[*] Đã phát hiện {tcpPortMap.Count} cổng TCP/IP được cấu hình.", ConsoleColor.Gray);
+
+            // Tập hợp các IP máy in đang tồn tại trong hệ thống để tránh gán nhầm
+            var existingPrinterIps = new HashSet<string>(
+                tcpPortMap.Values.Where(v => !string.IsNullOrWhiteSpace(v)),
+                StringComparer.OrdinalIgnoreCase);
 
             // 1.2 Danh sách lọc máy in ảo mặc định
             var virtualPrinterKeywords = new[]
@@ -163,7 +174,7 @@ namespace PrinterFixTool
 
                     _totalPrintersScanned++;
                     Console.WriteLine();
-                    PrintColored($"----------------------------------------------------------------------", ConsoleColor.DarkGray);
+                    PrintColored("----------------------------------------------------------------------", ConsoleColor.DarkGray);
                     PrintColored($"[MÁY IN #{_totalPrintersScanned}] {printerName}", ConsoleColor.White);
                     PrintColored($"  - Cổng (Port): {portName}", ConsoleColor.Gray);
                     PrintColored($"  - Driver    : {driverName}", ConsoleColor.Gray);
@@ -203,8 +214,8 @@ namespace PrinterFixTool
                     // 1.4 Kiểm tra lỗi vật lý (PrinterStatus, ExtendedPrinterStatus, DetectedErrorState)
                     CheckPhysicalPrinterErrors(printer);
 
-                    // 1.5 Xác định địa chỉ mạng và Ping kiểm tra kết nối vật lý
-                    CheckPrinterNetworkConnectivity(portName, tcpPortMap);
+                    // 1.5 Xác định địa chỉ mạng, Ping và Tự động quét tìm IP mới nếu mất kết nối
+                    await CheckPrinterNetworkConnectivityAsync(portName, tcpPortMap, existingPrinterIps);
                 }
 
                 if (_totalPrintersScanned == 0)
@@ -245,12 +256,8 @@ namespace PrinterFixTool
         private static void CheckPhysicalPrinterErrors(ManagementObject printer)
         {
             // Trích xuất các mã trạng thái
-            ushort printerStatus = 0;
             ushort extPrinterStatus = 0;
             ushort detectedErrorState = 0;
-
-            if (printer["PrinterStatus"] != null)
-                ushort.TryParse(printer["PrinterStatus"].ToString(), out printerStatus);
 
             if (printer["ExtendedPrinterStatus"] != null)
                 ushort.TryParse(printer["ExtendedPrinterStatus"].ToString(), out extPrinterStatus);
@@ -322,10 +329,14 @@ namespace PrinterFixTool
             }
         }
 
-        private static void CheckPrinterNetworkConnectivity(string portName, Dictionary<string, string> tcpPortMap)
+        private static async Task CheckPrinterNetworkConnectivityAsync(
+            string portName,
+            Dictionary<string, string> tcpPortMap,
+            HashSet<string> existingPrinterIps)
         {
             string? targetHost = null;
             string connectionType = "";
+            bool isTcpPort = false;
 
             if (string.IsNullOrWhiteSpace(portName))
             {
@@ -348,6 +359,7 @@ namespace PrinterFixTool
             {
                 targetHost = mappedHost;
                 connectionType = $"Cổng mạng TCP/IP tiêu chuẩn (IP: {targetHost})";
+                isTcpPort = true;
             }
             // Trường hợp 3: Port Name có dạng IP_xxx.xxx.xxx.xxx
             else if (portName.StartsWith("IP_", StringComparison.OrdinalIgnoreCase))
@@ -355,12 +367,14 @@ namespace PrinterFixTool
                 string ipCandidate = portName.Substring(3).Trim();
                 targetHost = ipCandidate;
                 connectionType = $"Cổng TCP/IP qua tên cổng (IP: {targetHost})";
+                isTcpPort = true;
             }
             // Trường hợp 4: Port Name là địa chỉ IP thuần
             else if (Regex.IsMatch(portName, @"^(\d{1,3}\.){3}\d{1,3}$"))
             {
                 targetHost = portName;
                 connectionType = $"Cổng mạng IP trực tiếp ({targetHost})";
+                isTcpPort = true;
             }
             // Trường hợp 5: Cổng cục bộ (USB, LPT, COM, WSD, v.v.)
             else
@@ -375,6 +389,7 @@ namespace PrinterFixTool
                 PrintColored($"  - Kiểu kết nối: {connectionType}", ConsoleColor.Cyan);
                 PrintColored($"  -> Đang gửi gói tin Ping kiểm tra đến {targetHost} (Timeout: 2000ms)...", ConsoleColor.Yellow);
 
+                bool pingSuccess = false;
                 try
                 {
                     using var ping = new Ping();
@@ -382,7 +397,9 @@ namespace PrinterFixTool
 
                     if (reply.Status == IPStatus.Success)
                     {
+                        pingSuccess = true;
                         PrintColored($"  -> [Mạng OK] Ping tới {targetHost} thành công (Thời gian phản hồi: {reply.RoundtripTime} ms).", ConsoleColor.Green);
+                        existingPrinterIps.Add(targetHost);
                     }
                     else
                     {
@@ -392,6 +409,16 @@ namespace PrinterFixTool
                 catch (Exception ex)
                 {
                     PrintNetworkFailure(targetHost, ex.InnerException?.Message ?? ex.Message);
+                }
+
+                // NẾU PING THẤT BẠI VÀ LÀ MÁY IN STANDARD TCP/IP PORT -> KÍCH HOẠT QUÉT MẠNG LAN (PORT 9100)
+                if (!pingSuccess && isTcpPort)
+                {
+                    Console.WriteLine();
+                    PrintColored($"  [!] PHÁT HIỆN MÁY IN MẠNG BỊ MẤT KẾT NỐI (IP CŨ: {targetHost})", ConsoleColor.Yellow);
+                    PrintColored("  [*] Đang khởi động tính năng tự động dò tìm IP mới trên mạng LAN (Port 9100)...", ConsoleColor.Cyan);
+
+                    await DiscoverAndUpdatePrinterIpAsync(portName, targetHost, existingPrinterIps, tcpPortMap);
                 }
             }
         }
@@ -403,7 +430,289 @@ namespace PrinterFixTool
             PrintColored("     1. Kiểm tra nguồn điện máy in: Đảm bảo máy in đang bật đèn xanh và không ở chế độ Sleep sâu.", ConsoleColor.Yellow);
             PrintColored("     2. Kiểm tra dây cáp mạng LAN hoặc kết nối Wi-Fi trên máy in.", ConsoleColor.Yellow);
             PrintColored("     3. Nếu là máy in chia sẻ qua máy tính khác (UNC): Kiểm tra máy chủ có đang bật và thông mạng không.", ConsoleColor.Yellow);
-            PrintColored("     4. Kiểm tra địa chỉ IP máy in: Có thể IP đã bị thay đổi do Router cấp phát lại DHCP. Hãy in bản cấu hình mạng trên máy in để kiểm tra IP hiện tại.", ConsoleColor.Yellow);
+            PrintColored("     4. Kiểm tra địa chỉ IP máy in: Có thể IP đã bị thay đổi do Router cấp phát lại DHCP.", ConsoleColor.Yellow);
+        }
+
+        #endregion
+
+        #region Thuật toán quét mạng LAN (Port 9100) & Cập nhật IP mới
+
+        private static async Task DiscoverAndUpdatePrinterIpAsync(
+            string portName,
+            string oldIp,
+            HashSet<string> existingPrinterIps,
+            Dictionary<string, string> tcpPortMap)
+        {
+            // 2.1 Tách lấy Subnet prefix từ oldIp (hoặc fallback từ card mạng cục bộ)
+            string subnetPrefix = "";
+            if (IPAddress.TryParse(oldIp, out var parsedIp) && parsedIp.AddressFamily == AddressFamily.InterNetwork)
+            {
+                var octets = oldIp.Split('.');
+                if (octets.Length == 4)
+                {
+                    subnetPrefix = $"{octets[0]}.{octets[1]}.{octets[2]}.";
+                }
+            }
+
+            // Lấy danh sách IP của chính máy tính đang chạy để loại trừ
+            var localIps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus == OperationalStatus.Up && ni.NetworkInterfaceType != NetworkInterfaceType.Loopback)
+                    {
+                        foreach (var ua in ni.GetIPProperties().UnicastAddresses)
+                        {
+                            if (ua.Address.AddressFamily == AddressFamily.InterNetwork)
+                            {
+                                localIps.Add(ua.Address.ToString());
+
+                                // Nếu chưa có subnet từ oldIp, lấy từ card mạng máy trạm
+                                if (string.IsNullOrEmpty(subnetPrefix))
+                                {
+                                    var octs = ua.Address.ToString().Split('.');
+                                    if (octs.Length == 4)
+                                    {
+                                        subnetPrefix = $"{octs[0]}.{octs[1]}.{octs[2]}.";
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                PrintColored($"     [LƯU Ý] Không thể quét thông tin card mạng nội bộ: {ex.Message}", ConsoleColor.DarkYellow);
+            }
+
+            if (string.IsNullOrEmpty(subnetPrefix))
+            {
+                PrintColored($"  -> [LỖI] Không thể xác định dải mạng Subnet từ IP cũ '{oldIp}'.", ConsoleColor.Red);
+                return;
+            }
+
+            PrintColored($"  [*] Bắt đầu quét nhanh dải mạng {subnetPrefix}1 -> {subnetPrefix}254 qua TCP Port 9100 (RAW Print)...", ConsoleColor.Yellow);
+            PrintColored("      (Sử dụng cơ chế song song đa luồng với timeout 280ms/host, hoàn thành trong ~1-2 giây)", ConsoleColor.DarkGray);
+
+            var sw = Stopwatch.StartNew();
+            var candidates = new ConcurrentBag<(string Ip, string HostName)>();
+
+            // Quét đồng thời từ .1 đến .254
+            var scanTasks = new List<Task>();
+            for (int i = 1; i <= 254; i++)
+            {
+                string targetIp = $"{subnetPrefix}{i}";
+
+                // Bỏ qua IP cũ và IP của chính máy tính đang chạy
+                if (targetIp.Equals(oldIp, StringComparison.OrdinalIgnoreCase) || localIps.Contains(targetIp))
+                {
+                    continue;
+                }
+
+                scanTasks.Add(Task.Run(async () =>
+                {
+                    if (await IsPortOpenAsync(targetIp, 9100, 280))
+                    {
+                        string hostName = "";
+                        try
+                        {
+                            using var dnsCts = new CancellationTokenSource(300);
+                            var dnsTask = Dns.GetHostEntryAsync(targetIp);
+                            var completed = await Task.WhenAny(dnsTask, Task.Delay(300, dnsCts.Token));
+                            if (completed == dnsTask)
+                            {
+                                var entry = await dnsTask;
+                                hostName = entry.HostName ?? "";
+                            }
+                        }
+                        catch
+                        {
+                            // Bỏ qua lỗi nếu IP không phân giải được Reverse DNS
+                        }
+
+                        candidates.Add((targetIp, hostName));
+                    }
+                }));
+            }
+
+            await Task.WhenAll(scanTasks);
+            sw.Stop();
+
+            PrintColored($"  [*] Quét mạng hoàn tất trong {sw.ElapsedMilliseconds} ms.", ConsoleColor.Gray);
+
+            // 2.2 Lọc ra các IP ứng viên CHƯA nằm trong danh sách existingPrinterIps (các máy in khác đã cấu hình)
+            var validCandidates = candidates
+                .Where(c => !existingPrinterIps.Contains(c.Ip) && !c.Ip.Equals(oldIp, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(c =>
+                {
+                    var parts = c.Ip.Split('.');
+                    return (parts.Length == 4 && int.TryParse(parts[3], out int lastOctet)) ? lastOctet : 0;
+                })
+                .ToList();
+
+            // 2.3 Phân loại và xử lý an toàn tránh gán nhầm
+            if (validCandidates.Count == 0)
+            {
+                // Trường hợp 1: Không tìm thấy IP nào mở port 9100
+                PrintColored("  -> [KHÔNG TÌM THẤY THIẾT BỊ MỚI] Không phát hiện bất kỳ thiết bị nào mở cổng 9100 (RAW Print) trong dải mạng!", ConsoleColor.Red);
+                PrintColored("     => KẾT LUẬN: Máy in hiện đang TẮT NGUỒN, RÚT/TUỘT DÂY MẠNG LAN, hoặc đang nằm ở phân vùng mạng khác (khác VLAN).", ConsoleColor.Yellow);
+            }
+            else if (validCandidates.Count == 1)
+            {
+                // Trường hợp 2: Tìm thấy DUY NHẤT 1 IP máy in mới
+                var singleCandidate = validCandidates[0];
+                string hostInfo = string.IsNullOrWhiteSpace(singleCandidate.HostName) ? "" : $" (Tên máy chủ: {singleCandidate.HostName})";
+                PrintColored($"  -> [TÌM THẤY DUY NHẤT 1 MÁY IN MỚI] Phát hiện IP {singleCandidate.Ip}{hostInfo} mở cổng 9100!", ConsoleColor.Green);
+                PrintColored($"  -> Tiến hành tự động cập nhật cổng '{portName}' từ IP cũ [{oldIp}] sang IP mới [{singleCandidate.Ip}]...", ConsoleColor.Yellow);
+
+                bool success = ApplyNewPrinterIp(portName, singleCandidate.Ip);
+                if (success)
+                {
+                    existingPrinterIps.Add(singleCandidate.Ip);
+                    tcpPortMap[portName] = singleCandidate.Ip;
+                }
+            }
+            else
+            {
+                // Trường hợp 3: Tìm thấy từ 2 IP mở port 9100 trở lên -> Cho người dùng chọn để tránh gán nhầm
+                PrintColored($"  -> [CẢNH BÁO: TÌM THẤY {validCandidates.Count} MÁY IN MỞ CỔNG 9100] Cần xác nhận để tránh gán nhầm máy in phòng ban khác:", ConsoleColor.Yellow);
+                for (int idx = 0; idx < validCandidates.Count; idx++)
+                {
+                    var item = validCandidates[idx];
+                    string hostInfo = string.IsNullOrWhiteSpace(item.HostName) ? "" : $" (HostName: {item.HostName})";
+                    PrintColored($"     [{idx + 1}] IP: {item.Ip}{hostInfo}", ConsoleColor.White);
+                }
+                PrintColored("     [0] Bỏ qua, không thay đổi cấu hình cổng.", ConsoleColor.DarkGray);
+
+                if (Console.IsInputRedirected)
+                {
+                    PrintColored("  -> [LƯU Ý] Môi trường không tương tác (Non-interactive/Script). Bỏ qua tự động cập nhật để đảm bảo an toàn tuyệt đối.", ConsoleColor.Yellow);
+                }
+                else
+                {
+                    Console.Write($"  -> Vui lòng nhập số thứ tự IP bạn muốn gán (0 - {validCandidates.Count}): ");
+                    string? input = Console.ReadLine();
+                    if (int.TryParse(input, out int selectedIndex) && selectedIndex >= 1 && selectedIndex <= validCandidates.Count)
+                    {
+                        var chosen = validCandidates[selectedIndex - 1];
+                        PrintColored($"  -> Bạn đã chọn IP: {chosen.Ip}. Đang tiến hành cập nhật cổng '{portName}'...", ConsoleColor.Yellow);
+                        bool success = ApplyNewPrinterIp(portName, chosen.Ip);
+                        if (success)
+                        {
+                            existingPrinterIps.Add(chosen.Ip);
+                            tcpPortMap[portName] = chosen.Ip;
+                        }
+                    }
+                    else
+                    {
+                        PrintColored("  -> Người dùng đã chọn bỏ qua hoặc nhập số không hợp lệ. Giữ nguyên cấu hình cũ.", ConsoleColor.DarkYellow);
+                    }
+                }
+            }
+        }
+
+        private static async Task<bool> IsPortOpenAsync(string ip, int port, int timeoutMs)
+        {
+            try
+            {
+                using var client = new TcpClient();
+                using var cts = new CancellationTokenSource(timeoutMs);
+                if (IPAddress.TryParse(ip, out var address))
+                {
+                    await client.ConnectAsync(address, port, cts.Token);
+                }
+                else
+                {
+                    await client.ConnectAsync(ip, port, cts.Token);
+                }
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool ApplyNewPrinterIp(string portName, string newIp)
+        {
+            bool wmiSuccess = false;
+            bool regSuccess = false;
+
+            // 1. Thử cập nhật qua WMI (Win32_TCPIPPrinterPort)
+            try
+            {
+                string escapedPortName = portName.Replace("\\", "\\\\").Replace("'", "\\'");
+                using var searcher = new ManagementObjectSearcher($"SELECT * FROM Win32_TCPIPPrinterPort WHERE Name = '{escapedPortName}'");
+                using var results = searcher.Get();
+                foreach (ManagementObject port in results)
+                {
+                    port["HostAddress"] = newIp;
+                    port.Put();
+                    wmiSuccess = true;
+                    PrintColored($"     [WMI THÀNH CÔNG] Đã cập nhật HostAddress = {newIp} cho cổng '{portName}'.", ConsoleColor.Green);
+                    break;
+                }
+            }
+            catch (Exception ex)
+            {
+                PrintColored($"     [WMI LƯU Ý] Không thể cập nhật trực tiếp qua WMI: {ex.Message} (Sẽ cập nhật qua Registry).", ConsoleColor.DarkYellow);
+            }
+
+            // 2. Cập nhật trực tiếp vào Registry để đảm bảo thành công 100% trên mọi bản Windows
+            string regKeyPath = $@"SYSTEM\CurrentControlSet\Control\Print\Monitors\Standard TCP/IP Port\Ports\{portName}";
+            try
+            {
+                using var key = Registry.LocalMachine.OpenSubKey(regKeyPath, writable: true);
+                if (key != null)
+                {
+                    key.SetValue("IPAddress", newIp, RegistryValueKind.String);
+                    regSuccess = true;
+                    PrintColored($@"     [REGISTRY THÀNH CÔNG] Đã ghi IPAddress = {newIp} tại HKLM\{regKeyPath}.", ConsoleColor.Green);
+                }
+                else
+                {
+                    // Fallback: Tìm case-insensitive trong subkeys
+                    using var portsRoot = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Control\Print\Monitors\Standard TCP/IP Port\Ports", writable: true);
+                    if (portsRoot != null)
+                    {
+                        var subKeyNames = portsRoot.GetSubKeyNames();
+                        var matched = subKeyNames.FirstOrDefault(k => k.Equals(portName, StringComparison.OrdinalIgnoreCase));
+                        if (matched != null)
+                        {
+                            using var matchedKey = portsRoot.OpenSubKey(matched, writable: true);
+                            if (matchedKey != null)
+                            {
+                                matchedKey.SetValue("IPAddress", newIp, RegistryValueKind.String);
+                                regSuccess = true;
+                                PrintColored($@"     [REGISTRY THÀNH CÔNG] Đã ghi IPAddress = {newIp} tại HKLM\SYSTEM\CurrentControlSet\Control\Print\Monitors\Standard TCP/IP Port\Ports\{matched}.", ConsoleColor.Green);
+                            }
+                        }
+                    }
+                }
+            }
+            catch (UnauthorizedAccessException)
+            {
+                PrintColored(@"     [REGISTRY LỖI] Cần quyền Administrator để chỉnh sửa Registry HKLM!", ConsoleColor.Red);
+            }
+            catch (Exception ex)
+            {
+                PrintColored($"     [REGISTRY LỖI] Không thể ghi IPAddress vào Registry: {ex.Message}", ConsoleColor.Red);
+            }
+
+            if (wmiSuccess || regSuccess)
+            {
+                _ipUpdatedCount++;
+                PrintColored($"  -> [CẬP NHẬT HOÀN TẤT] Cổng '{portName}' đã được chuyển sang IP mới: {newIp}!", ConsoleColor.Green);
+                PrintColored("     [LƯU Ý QUAN TRỌNG] Dịch vụ Print Spooler sẽ được khởi động lại tại Module 2 để nạp lại cấu hình IP mới vào Windows.", ConsoleColor.Cyan);
+                return true;
+            }
+            else
+            {
+                PrintColored($"  -> [THẤT BẠI] Không thể cập nhật IP mới cho cổng '{portName}'.", ConsoleColor.Red);
+                return false;
+            }
         }
 
         #endregion
@@ -426,7 +735,7 @@ namespace PrinterFixTool
                 // Bước 2: Xóa toàn bộ file kẹt trong thư mục Spool PRINTERS
                 ClearSpoolerPrintersFolder();
 
-                // Bước 3: Khởi động lại dịch vụ Print Spooler
+                // Bước 3: Khởi động lại dịch vụ Print Spooler (Đồng thời nạp lại cấu hình IP mới nếu có)
                 StartSpoolerService(sc);
             }
             catch (Exception ex)
@@ -573,7 +882,7 @@ namespace PrinterFixTool
 
         private static void StartSpoolerService(ServiceController sc)
         {
-            PrintColored("[*] Đang khởi động lại dịch vụ Print Spooler...", ConsoleColor.Yellow);
+            PrintColored("[*] Đang khởi động lại dịch vụ Print Spooler (Để áp dụng cấu hình và dọn dẹp hàng đợi)...", ConsoleColor.Yellow);
             try
             {
                 sc.Refresh();
@@ -677,20 +986,21 @@ namespace PrinterFixTool
         {
             PrintSectionHeader("BẢNG TỔNG HỢP KẾT QUẢ XỬ LÝ");
 
-            Console.WriteLine($"┌─────────────────────────────────────────────────────────────┬───────────────────────────┐");
-            Console.WriteLine($"│ Hạng mục kiểm tra & khắc phục                               │ Trạng thái                │");
-            Console.WriteLine($"├─────────────────────────────────────────────────────────────┼───────────────────────────┤");
+            Console.WriteLine("┌─────────────────────────────────────────────────────────────┬───────────────────────────┐");
+            Console.WriteLine("│ Hạng mục kiểm tra & khắc phục                               │ Trạng thái                │");
+            Console.WriteLine("├─────────────────────────────────────────────────────────────┼───────────────────────────┤");
             Console.WriteLine($"│ 1. Tổng số máy in vật lý được quét                          │ {PadCenter(_totalPrintersScanned.ToString(), 25)} │");
             Console.WriteLine($"│ 2. Số máy in tự động gỡ Offline -> Online                   │ {PadCenter(_offlineFixedCount.ToString(), 25)} │");
             Console.WriteLine($"│ 3. Số máy in mạng (TCP/IP & UNC LAN) đã kiểm tra            │ {PadCenter(_networkPrintersCount.ToString(), 25)} │");
-            Console.WriteLine($"│ 4. Số file lệnh in kẹt đã dọn sạch (*.spl, *.shd, *.tmp)    │ {PadCenter(_spoolFilesRemoved.ToString(), 25)} │");
+            Console.WriteLine($"│ 4. Số máy in mạng mất kết nối được gán IP mới thành công    │ {PadCenter(_ipUpdatedCount.ToString(), 25)} │");
+            Console.WriteLine($"│ 5. Số file lệnh in kẹt đã dọn sạch (*.spl, *.shd, *.tmp)    │ {PadCenter(_spoolFilesRemoved.ToString(), 25)} │");
 
             string spoolerStatus = _spoolerRestartedSuccessfully ? "Đang chạy (Running) [OK]" : "Lỗi / Chưa chạy";
-            Console.WriteLine($"│ 5. Trạng thái dịch vụ Print Spooler                         │ {PadCenter(spoolerStatus, 25)} │");
+            Console.WriteLine($"│ 6. Trạng thái dịch vụ Print Spooler                         │ {PadCenter(spoolerStatus, 25)} │");
 
             string regStatus = _registryPatchedSuccessfully ? "Đã vá thành công [OK]" : "Chưa hoàn tất";
-            Console.WriteLine($"│ 6. Vá Registry mạng LAN (0x0000011b & 0x00000709)           │ {PadCenter(regStatus, 25)} │");
-            Console.WriteLine($"└─────────────────────────────────────────────────────────────┴───────────────────────────┘");
+            Console.WriteLine($"│ 7. Vá Registry mạng LAN (0x0000011b & 0x00000709)           │ {PadCenter(regStatus, 25)} │");
+            Console.WriteLine("└─────────────────────────────────────────────────────────────┴───────────────────────────┘");
         }
 
         private static string PadCenter(string text, int width)
